@@ -10,13 +10,13 @@ import (
 	"testing"
 
 	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/reporters"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 
 	_ "github.com/openshift/ptp-operator/test/conformance/ptp"
 	"github.com/openshift/ptp-operator/test/utils/clean"
 	testclient "github.com/openshift/ptp-operator/test/utils/client"
+	ptpReporter "github.com/openshift/ptp-operator/test/utils/ginkgo_reporter"
 	"github.com/openshift/ptp-operator/test/utils/testconfig"
 )
 
@@ -42,7 +42,7 @@ func TestTest(t *testing.T) {
 
 	rr := []Reporter{}
 	if junitPath != nil {
-		rr = append(rr, reporters.NewJUnitReporter(*junitPath))
+		rr = append(rr, ptpReporter.NewPTPJUnitReporter(*junitPath))
 	}
 	InitDeletePtpConfig()
 	RunSpecsWithDefaultAndCustomReporters(t, "PTP e2e integration tests", rr)
