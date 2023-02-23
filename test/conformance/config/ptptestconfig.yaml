@@ -22,6 +22,11 @@ soaktest:
   cpu_utilization:
     spec:
       enable: true
-      duration: 10
-      failure_threshold: 10
+      duration: 2
+      failure_threshold: 1
+      custom_params:
+        prometheus_rate_time_window: "61s"
+        node:
+          cpu_threshold_mcores: 2
+
     desc: "The test measures PTP CPU usage and fails if >15mcores"

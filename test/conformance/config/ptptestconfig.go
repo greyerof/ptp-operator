@@ -4,7 +4,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"time"
 
 	"github.com/creasty/defaults"
 	"github.com/sirupsen/logrus"
@@ -15,8 +14,6 @@ const (
 	// Default cpu usage threshold in milliCpus.
 	PtpDefaultMilliCoresUsageThreshold = 15
 )
-
-type yamlTimeDur time.Duration
 
 type GlobalConfig struct {
 	MinOffset int `yaml:"minoffset"`
@@ -40,12 +37,12 @@ func (t *TestSpec) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 type SoakTestConfig struct {
-	DisableSoakTest      bool           `yaml:"disable_all"`
-	FailureThreshold     int            `default:"1"`
-	Duration             int64          `yaml:"duration"`
-	EventOutputFile      string         `yaml:"event_output_file" default:"./event-output.csv"`
-	SlaveClockSyncConfig SlaveClockSync `yaml:"slave_clock_sync"`
-	CpuUtilization       CpuUtilization `yaml:"cpu_utilization"`
+	DisableSoakTest      bool                     `yaml:"disable_all"`
+	FailureThreshold     int                      `default:"1"`
+	Duration             int64                    `yaml:"duration"`
+	EventOutputFile      string                   `yaml:"event_output_file" default:"./event-output.csv"`
+	SlaveClockSyncConfig SlaveClockSync           `yaml:"slave_clock_sync"`
+	CpuUtilization       CpuUtilizationTestConfig `yaml:"cpu_utilization"`
 }
 
 func (t *SoakTestConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -64,11 +61,6 @@ type PtpTestConfig struct {
 }
 
 // Individual test configuration
-
-type CpuUtilization struct {
-	TestSpec    TestSpec `yaml:"spec"`
-	Description string   `yaml:"desc"`
-}
 
 type SlaveClockSync struct {
 	TestSpec    TestSpec `yaml:"spec"`

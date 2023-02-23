@@ -11,6 +11,7 @@ import (
 
 	"github.com/openshift/ptp-operator/test/pkg/client"
 	"github.com/openshift/ptp-operator/test/pkg/pods"
+	prometheusModel "github.com/prometheus/common/model"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,6 +20,7 @@ import (
 const (
 	openshiftMonitoringNamespace = "openshift-monitoring"
 	prometheusResponseSuccess    = "success"
+	kubeletServiceMonitor        = "kubelet"
 )
 
 type PrometheusQueryResponse struct {
@@ -91,6 +93,8 @@ func RunPrometheusQuery(prometheusPod *corev1.Pod, query string, response *Prome
 	}
 
 	outStr := stdout.String()
+	logrus.Warnf("Prom Query: %s", query)
+	logrus.Warnf("Prom Response: %v", outStr)
 	err = json.Unmarshal([]byte(outStr), &response)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshall prometheus response:\n%s\n%v", outStr, err)
@@ -105,7 +109,8 @@ func RunPrometheusQuery(prometheusPod *corev1.Pod, query string, response *Prome
 
 // RunPrometheusQueryWithRetries runs RunPrometheusQuery but retries in case of failure, waiting
 // retryInterval perdiod before the next attempt.
-func RunPrometheusQueryWithRetries(prometheusPod *corev1.Pod, query string, retries int, retryInterval time.Duration, response *PrometheusQueryResponse) error {
+func RunPrometheusQueryWithRetries(prometheusPod *corev1.Pod, query string, retries int, retryInterval time.Duration, response *PrometheusQueryResponse,
+	checkerFunc func(response *PrometheusQueryResponse) bool) error {
 	for i := 0; i <= retries; i++ {
 		logrus.Debugf("querying prometheus, query %s, attempt %d", query, i)
 		// In case it's not the first try, sleep before trying again.
@@ -115,12 +120,50 @@ func RunPrometheusQueryWithRetries(prometheusPod *corev1.Pod, query string, retr
 
 		err := RunPrometheusQuery(prometheusPod, query, response)
 		if err == nil {
-			// Valid response, return here.
-			return nil
+			// If we don't need to use the callback the check the response, or
+			// the callback approves the response, we can return without error.
+			if checkerFunc == nil || checkerFunc(response) {
+				// Valid response, return here.
+				return nil
+			}
 		}
 
 		logrus.Debugf("failed to get a prometheus response for query %s: %v", query, err)
 	}
 
 	return fmt.Errorf("failed to get a (valid) response from prometheus")
+}
+
+// GetCadvisorScrapeInterval returns the current scrape internval (in secs) of cadvisor target
+// configured in kubelet's prometheus ServiceMonitor.
+func GetCadvisorScrapeInterval() (int, error) {
+	const (
+		cadvisorEndpointPath = "/metrics/cadvisor"
+	)
+
+	// Get ServiceMonitor for the kubelet.
+	monitor, err := client.Client.ServiceMonitors(openshiftMonitoringNamespace).Get(context.TODO(), kubeletServiceMonitor, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get kubelet client monitor %v", err)
+	}
+
+	// Search for the cadvisor endpoint config.
+	for i := range monitor.Spec.Endpoints {
+		endPoint := &monitor.Spec.Endpoints[i]
+		if endPoint.Path != cadvisorEndpointPath {
+			continue
+		}
+
+		// The interval is a prometheus' string-based type, with its own parsing func.
+		// Fortunately, prometheus.Duration is just a time.Duration.
+		duration, err := prometheusModel.ParseDuration(string(endPoint.Interval))
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse interval %v: %v", endPoint.Interval, err)
+		}
+
+		// Cast it to standard time.Duration and return in secs.
+		return int(time.Duration(duration).Seconds()), nil
+	}
+
+	return 0, errors.New("cadvisor endpoint not found")
 }
