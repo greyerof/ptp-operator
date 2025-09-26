@@ -55,6 +55,8 @@ const (
 	BoundaryClockString = "BC"
 	// DualNICBoundaryClockString matches the DualNICBC clock mode in Environement
 	DualNICBoundaryClockString = "DualNICBC"
+	// DualNICBoundaryClockHAString matches the DualNICBC HA clock mode in Environment
+	DualNICBoundaryClockHAString = "DualNICBCHA"
 	// TelcoGrandMasterClockString matches the T-GM clock mode in Environement
 	TelcoGrandMasterClockString = "TGM"
 	ptp4lEthernet               = "-2 --summary_interval -4"
@@ -90,6 +92,8 @@ const (
 	BoundaryClock
 	// DualNICBoundaryClock DualNIC Boundary Clock mode
 	DualNICBoundaryClock
+	// DualNICBoundaryClockHA DualNIC Boundary Clock HA mode
+	DualNICBoundaryClockHA
 	// GrandMaster mode
 	TelcoGrandMasterClock
 	// Discovery Discovery mode
@@ -339,6 +343,8 @@ func (mode PTPMode) String() string {
 		return BoundaryClockString
 	case DualNICBoundaryClock:
 		return DualNICBoundaryClockString
+	case DualNICBoundaryClockHA:
+		return DualNICBoundaryClockHAString
 	case TelcoGrandMasterClock:
 		return TelcoGrandMasterClockString
 	case Discovery:
@@ -360,6 +366,8 @@ func StringToMode(aString string) PTPMode {
 		return BoundaryClock
 	case strings.ToLower(DualNICBoundaryClockString):
 		return DualNICBoundaryClock
+	case strings.ToLower(DualNICBoundaryClockHAString):
+		return DualNICBoundaryClockHA
 	case strings.ToLower(TelcoGrandMasterClockString):
 		return TelcoGrandMasterClock
 	case strings.ToLower(DiscoveryString), strings.ToLower(legacyDiscoveryString):
@@ -408,13 +416,13 @@ func GetDesiredConfig(forceUpdate bool) TestConfig {
 	}
 
 	switch mode {
-	case OrdinaryClock, BoundaryClock, DualNICBoundaryClock, TelcoGrandMasterClock, DualFollowerClock, Discovery:
+	case OrdinaryClock, BoundaryClock, DualNICBoundaryClock, DualNICBoundaryClockHA, TelcoGrandMasterClock, DualFollowerClock, Discovery:
 		logrus.Infof("%s mode detected", mode)
 		GlobalConfig.PtpModeDesired = mode
 		GlobalConfig.Status = InitStatus
 		return GlobalConfig
 	case None:
-		logrus.Infof("No test mode specified using, %s mode. Specify the env variable PTP_TEST_MODE with one of %s, %s, %s, %s, %s", OrdinaryClock, Discovery, OrdinaryClock, BoundaryClock, TelcoGrandMasterClock, DualNICBoundaryClockString)
+		logrus.Infof("No test mode specified using, %s mode. Specify the env variable PTP_TEST_MODE with one of %s, %s, %s, %s, %s, %s, %s", OrdinaryClock, Discovery, OrdinaryClock, BoundaryClock, DualFollowerClockString, TelcoGrandMasterClock, DualNICBoundaryClockString, DualNICBoundaryClockHAString)
 		GlobalConfig.PtpModeDesired = OrdinaryClock
 		GlobalConfig.Status = InitStatus
 		return GlobalConfig
@@ -480,6 +488,8 @@ func CreatePtpConfigurations() error {
 			return PtpConfigBC(isExternalMaster)
 		case DualNICBoundaryClock:
 			return PtpConfigDualNicBC(isExternalMaster)
+		case DualNICBoundaryClockHA:
+			return PtpConfigDualNicBC(isExternalMaster, true)
 		case TelcoGrandMasterClock:
 			isExternalMaster = false // WPC GM is the only GM under test
 			return PtpConfigTelcoGM(isExternalMaster)
@@ -1199,8 +1209,38 @@ func PtpConfigBC(isExtGM bool) error {
 	return nil
 }
 
-func PtpConfigDualNicBC(isExtGM bool) error {
+// CreatePtpConfigHA creates a PTP configuration that only handles phc2sys for HA profile management
+func CreatePtpConfigHA(policyName string, nodeName string, haProfiles []string) error {
+	ptpSchedulingPolicy := SCHED_OTHER
+	configureFifo, err := strconv.ParseBool(os.Getenv("CONFIGURE_FIFO"))
+	if err == nil && configureFifo {
+		ptpSchedulingPolicy = SCHED_FIFO
+	}
 
+	// Sleep for a second to allow previous label on the same node to complete
+	time.Sleep(time.Second)
+	_, err = nodes.LabelNode(nodeName, pkg.PtpClockUnderTestNodeLabel, "")
+	if err != nil {
+		logrus.Errorf("Error setting HA node role label: %s", err)
+	}
+
+	phc2sysOpts := phc2sysSlave
+	haProfilesString := strings.Join(haProfiles, ",")
+	// Create HA-specific phc2sys options that reference the HA profiles
+	haSpecificPhc2sysOpts := fmt.Sprintf("%s --ha_enabled --ha_profiles %s", phc2sysOpts, haProfilesString)
+
+	return createConfig(policyName,
+		nil, // no specific interface for HA config
+		nil, // no ptp4l options
+		"",  // no ptp4l config
+		&haSpecificPhc2sysOpts,
+		pkg.PtpClockUnderTestNodeLabel,
+		pointer.Int64Ptr(int5),
+		ptpSchedulingPolicy,
+		pointer.Int64Ptr(int65))
+}
+
+func PtpConfigDualNicBC(isExtGM bool, phc2SysHaEnabled bool) error {
 	var grandmaster, bc1Master, bc1Slave, slave1, bc2Master, bc2Slave, slave2 int
 
 	BestSolution := ""
@@ -1252,7 +1292,7 @@ func PtpConfigDualNicBC(isExtGM bool) error {
 		}
 
 		err = CreatePtpConfigBC(pkg.PtpBcMaster1PolicyName, bc1MasterIf.NodeName,
-			bc1MasterIf.IfName, bc1SlaveIf.IfName, true)
+			bc1MasterIf.IfName, bc1SlaveIf.IfName, !phc2SysHaEnabled)
 		if err != nil {
 			logrus.Errorf("Error creating bc1master ptpconfig: %s", err)
 		}
@@ -1294,7 +1334,7 @@ func PtpConfigDualNicBC(isExtGM bool) error {
 		}
 
 		err = CreatePtpConfigBC(pkg.PtpBcMaster1PolicyName, bc1MasterIf.NodeName,
-			bc1MasterIf.IfName, bc1SlaveIf.IfName, true)
+			bc1MasterIf.IfName, bc1SlaveIf.IfName, !phc2SysHaEnabled)
 		if err != nil {
 			logrus.Errorf("Error creating bc1master ptpconfig: %s", err)
 		}
@@ -1318,7 +1358,7 @@ func PtpConfigDualNicBC(isExtGM bool) error {
 		bc2SlaveIf := GlobalConfig.L2Config.GetPtpIfList()[(*data.solutions[BestSolution])[FirstSolution][bc2Slave]]
 
 		err := CreatePtpConfigBC(pkg.PtpBcMaster1PolicyName, bc1MasterIf.NodeName,
-			bc1MasterIf.IfName, bc1SlaveIf.IfName, true)
+			bc1MasterIf.IfName, bc1SlaveIf.IfName, !phc2SysHaEnabled)
 		if err != nil {
 			logrus.Errorf("Error creating bc1master ptpconfig: %s", err)
 		}
@@ -1345,7 +1385,7 @@ func PtpConfigDualNicBC(isExtGM bool) error {
 		slave2If := GlobalConfig.L2Config.GetPtpIfList()[(*data.solutions[BestSolution])[FirstSolution][slave2]]
 
 		err := CreatePtpConfigBC(pkg.PtpBcMaster1PolicyName, bc1MasterIf.NodeName,
-			bc1MasterIf.IfName, bc1SlaveIf.IfName, true)
+			bc1MasterIf.IfName, bc1SlaveIf.IfName, !phc2SysHaEnabled)
 		if err != nil {
 			logrus.Errorf("Error creating bc1master ptpconfig: %s", err)
 		}
@@ -1367,6 +1407,30 @@ func PtpConfigDualNicBC(isExtGM bool) error {
 			logrus.Errorf("Error creating Slave2 ptpconfig: %s", err)
 		}
 	}
+
+	// Create the third HA-specific phc2sys config if HA is enabled
+	if phc2SysHaEnabled {
+		// Determine the node for the HA config - use the same node as BC1
+		var haNodeName string
+		switch BestSolution {
+		case AlgoDualNicBCWithSlavesString, AlgoDualNicBCString:
+			bc1Master = (*data.testClockRolesAlgoMapping[BestSolution])[BC1Master]
+			bc1MasterIf := GlobalConfig.L2Config.GetPtpIfList()[(*data.solutions[BestSolution])[FirstSolution][bc1Master]]
+			haNodeName = bc1MasterIf.NodeName
+		case AlgoDualNicBCExtGMString, AlgoDualNicBCWithSlavesExtGMString:
+			bc1Master = (*data.testClockRolesAlgoMapping[BestSolution])[BC1Master]
+			bc1MasterIf := GlobalConfig.L2Config.GetPtpIfList()[(*data.solutions[BestSolution])[FirstSolution][bc1Master]]
+			haNodeName = bc1MasterIf.NodeName
+		}
+
+		// Create HA config with profiles from the two BC configs
+		haProfiles := []string{pkg.PtpBcMaster1PolicyName, pkg.PtpBcMaster2PolicyName}
+		err := CreatePtpConfigHA(pkg.PtpDualNicBCHAPolicyName, haNodeName, haProfiles)
+		if err != nil {
+			logrus.Errorf("Error creating HA ptpconfig: %s", err)
+		}
+	}
+
 	return nil
 }
 
