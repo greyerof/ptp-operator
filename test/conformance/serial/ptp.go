@@ -63,6 +63,8 @@ var (
 	clockClassPattern = `^openshift_ptp_clock_class\{(?:config="ptp4l\.\d+\.config",)?node="([^"]+)",process="([^"]+)"\}\s+(\d+)`
 	clockClassRe      = regexp.MustCompile(clockClassPattern)
 )
+
+
 var DesiredMode = testconfig.GetDesiredConfig(true).PtpModeDesired
 
 var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, func() {
@@ -143,6 +145,64 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			}
 		})
 
+	})
+
+	//checking whether the operator is resilient to invalid configurations
+	Context("PTP Operator Resilience to Invalid Configurations", func() {
+		invalidConfigName := "invalid-resilience-test-config"
+		var initialRestartCount int32
+
+		BeforeEach(func() {
+			By("Getting the operator pod's initial restart count")
+			ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=ptp-operator"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(ptpPods.Items)).To(Equal(1), "Expected to find one ptp-operator pod")
+			operatorPod := ptpPods.Items[0]
+
+			initialRestartCount = -1 // Sentinel value
+			for _, containerStatus := range operatorPod.Status.ContainerStatuses {
+				if containerStatus.Name == "ptp-operator" {
+					initialRestartCount = containerStatus.RestartCount
+					break
+				}
+			}
+			Expect(initialRestartCount).NotTo(Equal(-1), "Could not find 'ptp-operator' container status")
+			By(fmt.Sprintf("Initial restart count is %d", initialRestartCount))
+
+			By("Applying an invalid PtpConfig")
+			err = testconfig.CreateInvalidPtpConfig(invalidConfigName)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create invalid PtpConfig")
+		})
+
+		AfterEach(func() {
+			By("Cleaning up the invalid PtpConfig")
+			err := client.Client.PtpV1Interface.PtpConfigs(pkg.PtpLinuxDaemonNamespace).Delete(context.Background(), invalidConfigName, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete invalid PtpConfig")
+		})
+
+		It("Should not restart the operator pod", func() {
+			By("Waiting for 10 seconds")
+			time.Sleep(10 * time.Second)
+
+			By("Getting the operator pod's final status")
+			ptpPods, err := client.Client.CoreV1().Pods(pkg.PtpLinuxDaemonNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "name=ptp-operator"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(ptpPods.Items)).To(Equal(1))
+			operatorPod := ptpPods.Items[0]
+
+			var finalRestartCount int32 = -1
+			for _, containerStatus := range operatorPod.Status.ContainerStatuses {
+				if containerStatus.Name == "ptp-operator" {
+					finalRestartCount = containerStatus.RestartCount
+					break
+				}
+			}
+			Expect(finalRestartCount).NotTo(Equal(-1), "Could not find 'ptp-operator' container status after waiting")
+			By(fmt.Sprintf("Final restart count is %d", finalRestartCount))
+
+			Expect(operatorPod.Status.Phase).To(Equal(v1core.PodRunning), "Operator pod should remain in a running state")
+			Expect(finalRestartCount).To(Equal(initialRestartCount), "Operator pod restart count should not have changed")
+		})
 	})
 
 	Describe("PTP e2e tests", func() {
