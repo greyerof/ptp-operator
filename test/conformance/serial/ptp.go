@@ -158,7 +158,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			Expect(len(ptpPods.Items)).To(Equal(1), "Expected to find one ptp-operator pod")
 			operatorPod := ptpPods.Items[0]
 
-			initialRestartCount = -5 // Sentinel value
+			initialRestartCount = -1 // Sentinel value
 			for _, containerStatus := range operatorPod.Status.ContainerStatuses {
 				if containerStatus.Name == "ptp-operator" {
 					initialRestartCount = containerStatus.RestartCount
