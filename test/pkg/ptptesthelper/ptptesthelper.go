@@ -214,6 +214,7 @@ func CreatePtpTestPrivilegedDaemonSet(daemonsetName, daemonsetNamespace, daemons
 	cpuReq := "100m"
 	memLim := "100M"
 	memReq := "100M"
+	logrus.Infof("Creating ptp test privileged daemonset %s in namespace %s with container name %s", daemonsetName, daemonsetNamespace, daemonsetContainerName)
 	var env []corev1.EnvVar
 	daemonSetRunningPods, err := k8sPriviledgedDs.CreateDaemonSet(daemonsetName, daemonsetNamespace, daemonsetContainerName, imageWithVersion, dummyLabels, env, pkg.TimeoutIn5Minutes, cpuReq, cpuLim, memReq, memLim)
 

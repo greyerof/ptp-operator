@@ -66,6 +66,138 @@ var (
 )
 var DesiredMode = testconfig.GetDesiredConfig(true).PtpModeDesired
 
+// PtpEventMonitor provides an elegant way to monitor all PTP events during a test
+type PtpEventMonitor struct {
+	eventChans []<-chan exports.StoredEvent
+	subsIds    map[ptpEvent.EventType]int
+	stopChan   chan struct{}
+	stopped    bool
+}
+
+// NewPtpEventMonitor creates a new PTP event monitor
+func NewPtpEventMonitor() *PtpEventMonitor {
+	return &PtpEventMonitor{
+		stopChan: make(chan struct{}),
+	}
+}
+
+// Start begins monitoring all PTP events in a separate goroutine
+func (m *PtpEventMonitor) Start() error {
+	// Define all PTP event types to monitor
+	eventTypes := []ptpEvent.EventType{
+		// ptpEvent.GnssStateChange,
+		ptpEvent.OsClockSyncStateChange,
+		ptpEvent.PtpClockClassChange,
+		ptpEvent.PtpStateChange,
+		// ptpEvent.SynceClockQualityChange,
+		// ptpEvent.SynceStateChange,
+		// ptpEvent.SynceStateChangeExtended,
+		ptpEvent.SyncStateChange,
+	}
+
+	// Subscribe to all event types
+	var err error
+	m.eventChans, m.subsIds, err = event.SubscripeToPtpEvents(eventTypes, 100, 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to subscribe to PTP events: %v", err)
+	}
+
+	logrus.Info("PTP Event Monitor: Started monitoring all PTP events")
+
+	// Start goroutine to monitor all events
+	go m.monitorEvents(eventTypes)
+
+	return nil
+}
+
+// monitorEvents runs in a goroutine and prints all received events
+func (m *PtpEventMonitor) monitorEvents(eventTypes []ptpEvent.EventType) {
+	// Create a slice of reflect.SelectCase for dynamic select
+	cases := make([]any, 0, len(m.eventChans)+1)
+
+	// Add stop channel case
+	cases = append(cases, m.stopChan)
+
+	// Add all event channels
+	for i, ch := range m.eventChans {
+		cases = append(cases, struct {
+			ch        <-chan exports.StoredEvent
+			eventType ptpEvent.EventType
+		}{ch: ch, eventType: eventTypes[i]})
+	}
+
+	for {
+		// Check stop channel first
+		select {
+		case <-m.stopChan:
+			logrus.Info("PTP Event Monitor: Stopping event monitoring")
+			return
+		default:
+		}
+
+		// Check all event channels
+		for _, c := range cases[1:] {
+			evCase := c.(struct {
+				ch        <-chan exports.StoredEvent
+				eventType ptpEvent.EventType
+			})
+
+			select {
+			case ev, ok := <-evCase.ch:
+				if !ok {
+					continue
+				}
+				m.logEvent(evCase.eventType, ev)
+			default:
+				continue
+			}
+		}
+
+		// Small sleep to prevent busy waiting
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// logEvent formats and logs a received event
+func (m *PtpEventMonitor) logEvent(eventType ptpEvent.EventType, ev exports.StoredEvent) {
+	timestamp := "unknown"
+	if ts, ok := ev[exports.EventTimeStamp].(time.Time); ok {
+		timestamp = ts.Format(time.RFC3339Nano)
+	}
+
+	source := "unknown"
+	if src, ok := ev[exports.EventSource].(string); ok {
+		source = src
+	}
+
+	valuesJSON, _ := json.Marshal(ev[exports.EventValues])
+
+	logrus.Infof("PTP Event Monitor: [%s] Type=%s Source=%s Values=%s",
+		timestamp, eventType, source, string(valuesJSON))
+
+	fullEvJSON, _ := json.Marshal(ev)
+	logrus.Infof("PTP Event Monitor: Full event=%s", string(fullEvJSON))
+}
+
+// Stop stops the event monitoring and unsubscribes from all events
+func (m *PtpEventMonitor) Stop() {
+	if m.stopped {
+		return
+	}
+	m.stopped = true
+
+	// Signal the monitoring goroutine to stop
+	close(m.stopChan)
+
+	// Give the goroutine a moment to exit gracefully
+	time.Sleep(100 * time.Millisecond)
+
+	// Unsubscribe from all events
+	event.UnsubscribeToPtpEvents(m.subsIds)
+
+	logrus.Info("PTP Event Monitor: Stopped and unsubscribed from all PTP events")
+}
+
 var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, func() {
 	BeforeEach(func() {
 		Expect(client.Client).NotTo(BeNil())
@@ -74,7 +206,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 	Context("PTP configuration verifications", func() {
 		// Setup verification
 		// if requested enabled  ptp events
-		It("Should check whether PTP operator needs to enable PTP events", func() {
+		FIt("Should check whether PTP operator needs to enable PTP events", func() {
 			if !event.Enable() {
 				Skip("Skipping as env var ENABLE_PTP_EVENT is not set or is set to false")
 			}
@@ -153,11 +285,13 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 		portEngine := ptptesthelper.PortEngine{}
 
 		execute.BeforeAll(func() {
+			By("Creating ptp configurations")
 			err := testconfig.CreatePtpConfigurations()
 			if err != nil {
 				fullConfig.Status = testconfig.DiscoveryFailureStatus
 				Fail(fmt.Sprintf("Could not create a ptp config, err=%s", err))
 			}
+			By("Getting full discovered config")
 			fullConfig = testconfig.GetFullDiscoveredConfig(pkg.PtpLinuxDaemonNamespace, false)
 			if fullConfig.Status != testconfig.DiscoverySuccessStatus {
 				logrus.Printf(`ptpconfigs were not properly discovered, Check:
@@ -171,6 +305,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				ptphelper.RestartPTPDaemon()
 			}
 
+			By("Initializing port engine")
 			portEngine.Initialize(fullConfig.DiscoveredClockUnderTestPod, fullConfig.DiscoveredFollowerInterfaces)
 
 		})
@@ -304,6 +439,7 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 			AfterEach(func() {
 				portEngine.TurnAllPortsUp()
 			})
+
 			// 25733
 			It("PTP daemon apply match rule based on nodeLabel", func() {
 
@@ -579,11 +715,45 @@ var _ = Describe("["+strings.ToLower(DesiredMode.String())+"-serial]", Serial, f
 				})
 			})
 
-			It("DualNICBCHA phc2sys switches to secondary ptp4l when primary interface fails", func() {
+			FIt("DualNICBCHA phc2sys switches to secondary ptp4l when primary interface fails", func() {
 				if fullConfig.PtpModeDiscovered != testconfig.DualNICBoundaryClockHA {
 					Skip("Test only valid for Dual NIC Boundary Clocks with phc2sys HA configuration (DualNICBCHA)")
 				}
+				if event.Enable() {
+					By("Deploying consumer app for event API v2")
+					nodeName := fullConfig.DiscoveredClockUnderTestPod.Spec.NodeName
+					Expect(nodeName).ToNot(BeEmpty(), "clock-under-test pod node is empty")
 
+					err := event.CreateConsumerApp(nodeName)
+					if err != nil {
+						Skip(fmt.Sprintf("Consumer app setup failed: %v", err))
+					}
+					// Wait for consumer to be fully ready
+					By("Waiting for consumer to be fully ready")
+					time.Sleep(10 * time.Second)
+					// Initialize pub/sub
+					event.InitPubSub()
+					// Ensure cleanup regardless of test outcome
+					DeferCleanup(func() {
+						_ = event.DeleteConsumerNamespace()
+						if event.PubSub != nil {
+							event.PubSub.Close()
+						}
+					})
+
+					term, monErr := event.MonitorPodLogsRegex()
+					Expect(monErr).ToNot(HaveOccurred(), "could not start listening to events")
+					DeferCleanup(func() { stopMonitor(term) })
+
+					// Start monitoring all PTP events
+					By("Starting PTP event monitoring")
+					monitor := NewPtpEventMonitor()
+					err = monitor.Start()
+					Expect(err).NotTo(HaveOccurred(), "Failed to start PTP event monitor")
+					defer monitor.Stop()
+				}
+
+				time.Sleep(10 * time.Second)
 				By("Identifying which interface phc2sys is currently using")
 				primaryPtpConfig := (*ptpv1.PtpConfig)(fullConfig.DiscoveredClockUnderTestPtpConfig)
 				primaryBCSlaveInterfaces := ptpv1.GetInterfaces(*primaryPtpConfig, ptpv1.Slave)

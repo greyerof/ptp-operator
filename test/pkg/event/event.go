@@ -5,12 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	ptpEvent "github.com/redhat-cne/sdk-go/pkg/event/ptp"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	ptpEvent "github.com/redhat-cne/sdk-go/pkg/event/ptp"
 
 	ce "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/k8snetworkplumbingwg/ptp-operator/test/pkg"
@@ -510,7 +511,7 @@ func MonitorPodLogsRegex() (term chan bool, err error) {
 }
 
 // returns last Regex match in the logs for a given pod
-func PushInitialEvent(eventType string, timeout time.Duration) (err error) {
+func PushInitialEvent(eventTypes []string, timeout time.Duration) (err error) {
 	namespace := ConsumerNamespace
 	podName := ConsumerPodName
 	containerName := ConsumerContainerName
@@ -520,6 +521,7 @@ func PushInitialEvent(eventType string, timeout time.Duration) (err error) {
 	podLogOptions := corev1.PodLogOptions{
 		Container: containerName,
 		Follow:    true,
+
 		TailLines: &count,
 	}
 
@@ -530,32 +532,51 @@ func PushInitialEvent(eventType string, timeout time.Duration) (err error) {
 	}
 	defer stream.Close()
 	start := time.Now()
-	for {
-		scanner := bufio.NewScanner(stream)
-		for scanner.Scan() {
-			t := time.Now()
-			elapsed := t.Sub(start)
-			if elapsed > timeout {
-				return fmt.Errorf("timedout PushInitialValue, waiting for log in ns=%s pod=%s, looking for = %s", namespace, podName, regex)
-			}
-			line := scanner.Text()
-			logrus.Trace(line)
+	scanner := bufio.NewScanner(stream)
+	r := regexp.MustCompile(regex)
+	initialEventRegexFound := map[string]bool{}
+	for _, eventType := range eventTypes {
+		initialEventRegexFound[eventType] = false
+	}
 
-			r := regexp.MustCompile(regex)
+	numInitialEventsFound := 0
+	for scanner.Scan() {
+		t := time.Now()
+		elapsed := t.Sub(start)
+		if elapsed > timeout {
+			return fmt.Errorf("timedout PushInitialValue, waiting for log in ns=%s pod=%s, looking for = %s", namespace, podName, regex)
+		}
+		line := scanner.Text()
+		logrus.Infof("LINE: %s", line)
+
+		for _, eventType := range eventTypes {
+			if initialEventRegexFound[eventType] {
+				continue
+			}
 			matches := r.FindAllStringSubmatch(line, -1)
 			if len(matches) > 0 {
 				aStoredEvent, eType, err := createStoredEvent([]byte(matches[0][1]))
 				if err != nil {
-					return err
+					return fmt.Errorf("failed to create stored event: %v", err)
 				}
-				if eType == eventType {
-					PubSub.Publish(eType, aStoredEvent)
+
+				// Do not publish event if it is not in the list of event types to push
+				if _, exists := initialEventRegexFound[eType]; !exists {
+					continue
+				}
+
+				PubSub.Publish(eType, aStoredEvent)
+				initialEventRegexFound[eType] = true
+				numInitialEventsFound++
+				logrus.Infof("Found initial event for eventType=%s", eType)
+				if numInitialEventsFound == len(eventTypes) {
 					return nil
 				}
 			}
 		}
-
 	}
+
+	return fmt.Errorf("failed to find initial event in pod logs: scanner returned EOF")
 }
 func createStoredEvent(data []byte) (aStoredEvent exports.StoredEvent, aType string, err error) {
 	apiVersion := ptphelper.PtpEventEnabled()
@@ -652,9 +673,9 @@ func SubscribeToGMChangeEvents(
 	lsCh, lID := PubSub.Subscribe(lsTopic, buffer)
 
 	if pushInitial {
-		_ = PushInitialEvent(gnssTopic, initialTTL)
-		_ = PushInitialEvent(ccTopic, initialTTL)
-		_ = PushInitialEvent(lsTopic, initialTTL)
+		_ = PushInitialEvent([]string{gnssTopic}, initialTTL)
+		_ = PushInitialEvent([]string{ccTopic}, initialTTL)
+		_ = PushInitialEvent([]string{lsTopic}, initialTTL)
 	}
 
 	return Subscriptions{
@@ -670,4 +691,41 @@ func SubscribeToGMChangeEvents(
 			PubSub.Unsubscribe(ccTopic, cID)
 			PubSub.Unsubscribe(lsTopic, lID)
 		}
+}
+
+func SubscripeToPtpEvents(eventTypes []ptpEvent.EventType, buffer int, initialTTL time.Duration) (
+	eventChans []<-chan exports.StoredEvent, subsIds map[ptpEvent.EventType]int, err error) {
+
+	// Subscribe to each event type
+	subsIds = map[ptpEvent.EventType]int{}
+	for _, eventType := range eventTypes {
+		topic := string(eventType)
+		ch, subId := PubSub.Subscribe(topic, buffer)
+		eventChans = append(eventChans, ch)
+		subsIds[eventType] = subId
+		logrus.Infof("Subscribed to PTP event type=%s with subscription id=%d", eventType, subId)
+	}
+
+	// Push initial events for each event type
+	if initialTTL > 0 {
+		eventTypes := make([]string, len(eventTypes))
+		for i, eventType := range eventTypes {
+			eventTypes[i] = string(eventType)
+		}
+		err := PushInitialEvent(eventTypes, initialTTL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to push initial events: %v", err)
+		}
+		logrus.Infof("Pushed initial events for PTP event types=%v", eventTypes)
+	}
+
+	return eventChans, subsIds, nil
+}
+
+func UnsubscribeToPtpEvents(subsIds map[ptpEvent.EventType]int) {
+	for eventType, subId := range subsIds {
+		topic := string(eventType)
+		PubSub.Unsubscribe(topic, subId)
+		logrus.Debugf("Unsubscribed from PTP event type=%s with subscription id=%d", eventType, subId)
+	}
 }
